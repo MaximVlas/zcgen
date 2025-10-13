@@ -1,0 +1,1 @@
+static inline __uint16_t w;

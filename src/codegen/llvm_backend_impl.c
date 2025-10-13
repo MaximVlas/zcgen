@@ -10,9 +10,10 @@
 #include <llvm-c/TargetMachine.h>
 #include <llvm-c/Analysis.h>
 #include <llvm-c/BitWriter.h>
-#include <llvm-c/Transforms/Scalar.h>
-#include <llvm-c/Transforms/IPO.h>
-#include <llvm-c/Transforms/Vectorize.h>
+#include <llvm-c/Transforms/PassBuilder.h>
+#include <llvm-c/Error.h>
+#include <stdarg.h>
+#include <stdlib.h>
 
 /* LLVM backend context */
 typedef struct LLVMBackendContext {
@@ -20,8 +21,6 @@ typedef struct LLVMBackendContext {
     LLVMModuleRef llvm_module;
     LLVMBuilderRef llvm_builder;
     LLVMTargetMachineRef target_machine;
-    LLVMPassManagerRef function_pass_manager;
-    LLVMPassManagerRef module_pass_manager;
     
     /* Symbol tables for code generation */
     void *named_values;  /* Hash table: name -> LLVMValueRef */
@@ -79,24 +78,54 @@ BackendContext *llvm_backend_init(const char *target_triple, const char *cpu,
         return NULL;
     }
     
-    /* Setup target machine if triple provided */
-    if (target_triple) {
-        char *error = NULL;
-        LLVMTargetRef target;
+    /* Setup target machine */
+    char *error = NULL;
+    LLVMTargetRef target = NULL;
+    char *allocated_triple = NULL;
+    const char *actual_triple = target_triple;
+    
+    /* If no target triple provided, use native target */
+    if (!actual_triple) {
+        allocated_triple = LLVMGetDefaultTargetTriple();
+        actual_triple = allocated_triple;
+    }
+    
+    if (actual_triple && LLVMGetTargetFromTriple(actual_triple, &target, &error)) {
+        fprintf(stderr, "Error getting target for '%s': %s\n", actual_triple, error);
+        LLVMDisposeMessage(error);
+        target = NULL;
         
-        if (LLVMGetTargetFromTriple(target_triple, &target, &error)) {
-            fprintf(stderr, "Error getting target: %s\n", error);
-            LLVMDisposeMessage(error);
-            /* Continue with default target */
-        } else {
-            const char *target_cpu = cpu ? cpu : "generic";
-            const char *target_features = "";
-            
-            ctx->target_machine = LLVMCreateTargetMachine(
-                target, target_triple, target_cpu, target_features,
-                LLVMCodeGenLevelDefault, LLVMRelocDefault, LLVMCodeModelDefault
-            );
+        /* Try to get native target as fallback if we weren't already using it */
+        if (!allocated_triple) {
+            if (allocated_triple) {
+                LLVMDisposeMessage(allocated_triple);
+            }
+            allocated_triple = LLVMGetDefaultTargetTriple();
+            if (allocated_triple && LLVMGetTargetFromTriple(allocated_triple, &target, &error)) {
+                fprintf(stderr, "Error getting native target: %s\n", error);
+                LLVMDisposeMessage(error);
+                target = NULL;
+            }
         }
+    }
+    
+    if (target) {
+        const char *target_cpu = cpu ? cpu : "generic";
+        const char *target_features = "";
+        
+        ctx->target_machine = LLVMCreateTargetMachine(
+            target, actual_triple, target_cpu, target_features,
+            LLVMCodeGenLevelDefault, LLVMRelocDefault, LLVMCodeModelDefault
+        );
+        
+        if (!ctx->target_machine) {
+            fprintf(stderr, "Failed to create target machine for '%s'\n", actual_triple);
+        }
+    }
+    
+    /* Clean up allocated triple */
+    if (allocated_triple) {
+        LLVMDisposeMessage(allocated_triple);
     }
     
     return (BackendContext *)ctx;
@@ -106,14 +135,6 @@ void llvm_backend_destroy(BackendContext *ctx_opaque) {
     if (!ctx_opaque) return;
     
     LLVMBackendContext *ctx = (LLVMBackendContext *)ctx_opaque;
-    
-    if (ctx->function_pass_manager) {
-        LLVMDisposePassManager(ctx->function_pass_manager);
-    }
-    
-    if (ctx->module_pass_manager) {
-        LLVMDisposePassManager(ctx->module_pass_manager);
-    }
     
     if (ctx->target_machine) {
         LLVMDisposeTargetMachine(ctx->target_machine);
@@ -146,10 +167,6 @@ void *llvm_create_module(BackendContext *ctx_opaque, const char *name) {
     LLVMBackendContext *ctx = (LLVMBackendContext *)ctx_opaque;
     
     ctx->llvm_module = LLVMModuleCreateWithNameInContext(name, ctx->llvm_context);
-    
-    /* Create pass managers */
-    ctx->function_pass_manager = LLVMCreateFunctionPassManagerForModule(ctx->llvm_module);
-    ctx->module_pass_manager = LLVMCreatePassManager();
     
     return ctx->llvm_module;
 }
@@ -334,6 +351,75 @@ void *llvm_codegen_expr(BackendContext *ctx_opaque, ASTNode *expr) {
         case AST_FLOAT_LITERAL:
             return codegen_float_literal(ctx, expr);
             
+        case AST_IDENTIFIER: {
+            /* Look up identifier - for now, check function parameters and functions */
+            const char *name = expr->data.identifier.name;
+            if (!name) return NULL;
+            
+            /* Check if it's a function parameter */
+            if (ctx->current_function) {
+                unsigned param_count = LLVMCountParams(ctx->current_function);
+                for (unsigned i = 0; i < param_count; i++) {
+                    LLVMValueRef param = LLVMGetParam(ctx->current_function, i);
+                    size_t name_len;
+                    const char *param_name = LLVMGetValueName2(param, &name_len);
+                    if (param_name && strcmp(param_name, name) == 0) {
+                        return param;
+                    }
+                }
+            }
+            
+            /* Check if it's a function in the module */
+            LLVMValueRef func = LLVMGetNamedFunction(ctx->llvm_module, name);
+            if (func) {
+                return func;
+            }
+            
+            set_error(ctx, "Undefined identifier: %s", name);
+            return NULL;
+        }
+        
+        case AST_CALL_EXPR: {
+            /* Function call: callee(args...) */
+            ASTNode *callee = expr->data.call_expr.callee;
+            if (!callee) return NULL;
+            
+            /* Get the function */
+            LLVMValueRef func = llvm_codegen_expr(ctx_opaque, callee);
+            if (!func) return NULL;
+            
+            /* Get function type */
+            LLVMTypeRef func_type = LLVMGlobalGetValueType(func);
+            
+            /* Generate arguments */
+            size_t arg_count = expr->data.call_expr.arg_count;
+            LLVMValueRef *args = NULL;
+            
+            if (arg_count > 0) {
+                args = xmalloc(sizeof(LLVMValueRef) * arg_count);
+                for (size_t i = 0; i < arg_count; i++) {
+                    args[i] = llvm_codegen_expr(ctx_opaque, expr->data.call_expr.args[i]);
+                    if (!args[i]) {
+                        xfree(args);
+                        return NULL;
+                    }
+                }
+            }
+            
+            /* Build call */
+            LLVMValueRef call = LLVMBuildCall2(
+                ctx->llvm_builder,
+                func_type,
+                func,
+                args,
+                arg_count,
+                "calltmp"
+            );
+            
+            if (args) xfree(args);
+            return call;
+        }
+            
         case AST_ADD_EXPR:
         case AST_SUB_EXPR:
         case AST_MUL_EXPR:
@@ -388,10 +474,245 @@ void llvm_codegen_stmt(BackendContext *ctx_opaque, ASTNode *stmt) {
             }
             break;
             
+        case AST_IF_STMT: {
+            /* if (condition) then_branch [else else_branch] */
+            ASTNode *condition = stmt->data.if_stmt.condition;
+            ASTNode *then_branch = stmt->data.if_stmt.then_branch;
+            ASTNode *else_branch = stmt->data.if_stmt.else_branch;
+            
+            if (!condition || !then_branch) {
+                set_error(ctx, "Invalid if statement");
+                break;
+            }
+            
+            /* Generate condition */
+            LLVMValueRef cond_val = llvm_codegen_expr(ctx_opaque, condition);
+            if (!cond_val) break;
+            
+            /* Convert condition to i1 (boolean) */
+            LLVMTypeRef cond_type = LLVMTypeOf(cond_val);
+            if (LLVMGetTypeKind(cond_type) != LLVMIntegerTypeKind || 
+                LLVMGetIntTypeWidth(cond_type) != 1) {
+                /* Compare with zero to get boolean */
+                LLVMValueRef zero = LLVMConstInt(cond_type, 0, 0);
+                cond_val = LLVMBuildICmp(ctx->llvm_builder, LLVMIntNE, cond_val, zero, "ifcond");
+            }
+            
+            /* Create basic blocks */
+            LLVMBasicBlockRef then_bb = LLVMAppendBasicBlockInContext(
+                ctx->llvm_context, ctx->current_function, "then");
+            LLVMBasicBlockRef else_bb = else_branch ? LLVMAppendBasicBlockInContext(
+                ctx->llvm_context, ctx->current_function, "else") : NULL;
+            LLVMBasicBlockRef merge_bb = LLVMAppendBasicBlockInContext(
+                ctx->llvm_context, ctx->current_function, "ifcont");
+            
+            /* Branch based on condition */
+            if (else_bb) {
+                LLVMBuildCondBr(ctx->llvm_builder, cond_val, then_bb, else_bb);
+            } else {
+                LLVMBuildCondBr(ctx->llvm_builder, cond_val, then_bb, merge_bb);
+            }
+            
+            /* Generate then branch */
+            LLVMPositionBuilderAtEnd(ctx->llvm_builder, then_bb);
+            llvm_codegen_stmt(ctx_opaque, then_branch);
+            
+            /* Add branch to merge if then block doesn't already have terminator */
+            if (!LLVMGetBasicBlockTerminator(then_bb)) {
+                LLVMBuildBr(ctx->llvm_builder, merge_bb);
+            }
+            
+            /* Generate else branch if present */
+            if (else_branch && else_bb) {
+                LLVMPositionBuilderAtEnd(ctx->llvm_builder, else_bb);
+                llvm_codegen_stmt(ctx_opaque, else_branch);
+                
+                /* Add branch to merge if else block doesn't already have terminator */
+                if (!LLVMGetBasicBlockTerminator(else_bb)) {
+                    LLVMBuildBr(ctx->llvm_builder, merge_bb);
+                }
+            }
+            
+            /* Continue in merge block */
+            LLVMPositionBuilderAtEnd(ctx->llvm_builder, merge_bb);
+            break;
+        }
+            
         default:
             set_error(ctx, "Unsupported statement type: %d", stmt->type);
             break;
     }
+}
+
+/* Helper: Get LLVM type from AST type node */
+static LLVMTypeRef get_llvm_type_from_ast(LLVMBackendContext *ctx, ASTNode *type_node) {
+    if (!type_node) {
+        /* Default to i32 if no type specified */
+        return LLVMInt32TypeInContext(ctx->llvm_context);
+    }
+    
+    /* For now, simple type mapping based on type name */
+    if (type_node->type == AST_TYPE && type_node->data.type.name) {
+        const char *name = type_node->data.type.name;
+        
+        if (strcmp(name, "void") == 0) {
+            return LLVMVoidTypeInContext(ctx->llvm_context);
+        } else if (strcmp(name, "int") == 0) {
+            return LLVMInt32TypeInContext(ctx->llvm_context);
+        } else if (strcmp(name, "char") == 0) {
+            return LLVMInt8TypeInContext(ctx->llvm_context);
+        } else if (strcmp(name, "short") == 0) {
+            return LLVMInt16TypeInContext(ctx->llvm_context);
+        } else if (strcmp(name, "long") == 0) {
+            return LLVMInt64TypeInContext(ctx->llvm_context);
+        } else if (strcmp(name, "float") == 0) {
+            return LLVMFloatTypeInContext(ctx->llvm_context);
+        } else if (strcmp(name, "double") == 0) {
+            return LLVMDoubleTypeInContext(ctx->llvm_context);
+        }
+    } else if (type_node->type == AST_POINTER_TYPE) {
+        /* Pointer type */
+        LLVMTypeRef pointee = LLVMInt8TypeInContext(ctx->llvm_context); /* default to void* */
+        if (type_node->child_count > 0 && type_node->children && type_node->children[0]) {
+            pointee = get_llvm_type_from_ast(ctx, type_node->children[0]);
+        }
+        return LLVMPointerType(pointee, 0);
+    }
+    
+    /* Default to i32 */
+    return LLVMInt32TypeInContext(ctx->llvm_context);
+}
+
+/* Helper: Generate function declaration */
+static void codegen_function_decl(LLVMBackendContext *ctx, ASTNode *func_decl) {
+    if (!ctx || !func_decl || func_decl->type != AST_FUNCTION_DECL) return;
+    
+    /* Ensure we have a module to work with */
+    if (!ctx->llvm_module) {
+        set_error(ctx, "No module available for function generation");
+        return;
+    }
+    
+    /* Debug output */
+    fprintf(stderr, "CODEGEN: Processing function declaration with %zu children\n", func_decl->child_count);
+    
+    /* 
+     * Parser AST structure for functions:
+     * FunctionDecl
+     *   ├─ Type (return type)
+     *   ├─ CompoundStmt (body)
+     *   └─ Identifier (function name)
+     *       └─ Unknown (parameter list)
+     *           ├─ ParamDecl
+     *           │   ├─ Type
+     *           │   └─ Identifier (parameter name)
+     *           └─ ...
+     */
+    
+    /* Find function name */
+    const char *func_name = "function";  /* default */
+    ASTNode *param_list = NULL;
+    
+    for (size_t i = 0; i < func_decl->child_count; i++) {
+        if (func_decl->children[i] && func_decl->children[i]->type == AST_IDENTIFIER) {
+            if (func_decl->children[i]->data.identifier.name) {
+                func_name = func_decl->children[i]->data.identifier.name;
+            }
+            /* Parameter list is a child of the identifier node */
+            if (func_decl->children[i]->child_count > 0 && func_decl->children[i]->children[0]) {
+                param_list = func_decl->children[i]->children[0];
+            }
+            break;
+        }
+    }
+    
+    /* Find return type */
+    LLVMTypeRef return_type = LLVMInt32TypeInContext(ctx->llvm_context);
+    for (size_t i = 0; i < func_decl->child_count; i++) {
+        if (func_decl->children[i] && func_decl->children[i]->type == AST_TYPE) {
+            return_type = get_llvm_type_from_ast(ctx, func_decl->children[i]);
+            break;
+        }
+    }
+    
+    /* Collect parameters */
+    LLVMTypeRef *param_types = NULL;
+    const char **param_names = NULL;
+    size_t param_count = 0;
+    
+    if (param_list && param_list->child_count > 0) {
+        param_count = param_list->child_count;
+        param_types = xmalloc(sizeof(LLVMTypeRef) * param_count);
+        param_names = xmalloc(sizeof(char *) * param_count);
+        
+        for (size_t i = 0; i < param_count; i++) {
+            ASTNode *param = param_list->children[i];
+            param_names[i] = NULL;
+            param_types[i] = LLVMInt32TypeInContext(ctx->llvm_context);  /* default */
+            
+            if (param && param->type == AST_PARAM_DECL) {
+                /* Find type and name in param children */
+                for (size_t j = 0; j < param->child_count; j++) {
+                    if (param->children[j] && param->children[j]->type == AST_TYPE) {
+                        param_types[i] = get_llvm_type_from_ast(ctx, param->children[j]);
+                    } else if (param->children[j] && param->children[j]->type == AST_IDENTIFIER) {
+                        if (param->children[j]->data.identifier.name) {
+                            param_names[i] = param->children[j]->data.identifier.name;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /* Create function type */
+    LLVMTypeRef func_type = LLVMFunctionType(return_type, param_types, param_count, 0);
+    
+    /* Add function to module */
+    LLVMValueRef function = LLVMAddFunction(ctx->llvm_module, func_name, func_type);
+    
+    /* Set parameter names and create allocas for them */
+    for (size_t i = 0; i < param_count; i++) {
+        LLVMValueRef llvm_param = LLVMGetParam(function, i);
+        if (param_names && param_names[i]) {
+            LLVMSetValueName2(llvm_param, param_names[i], strlen(param_names[i]));
+        }
+    }
+    
+    /* Create entry basic block */
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx->llvm_context, function, "entry");
+    LLVMPositionBuilderAtEnd(ctx->llvm_builder, entry);
+    
+    ctx->current_function = function;
+    ctx->current_block = entry;
+    
+    /* Find and generate function body */
+    ASTNode *body = NULL;
+    for (size_t i = 0; i < func_decl->child_count; i++) {
+        if (func_decl->children[i] && func_decl->children[i]->type == AST_COMPOUND_STMT) {
+            body = func_decl->children[i];
+            break;
+        }
+    }
+    
+    if (body) {
+        llvm_codegen_stmt((BackendContext *)ctx, body);
+        
+        /* Add return void if function doesn't return a value and last instruction isn't a return */
+        if (LLVMGetTypeKind(return_type) == LLVMVoidTypeKind) {
+            LLVMBasicBlockRef current_bb = LLVMGetInsertBlock(ctx->llvm_builder);
+            if (current_bb) {
+                LLVMValueRef last_inst = LLVMGetLastInstruction(current_bb);
+                if (!last_inst || LLVMGetInstructionOpcode(last_inst) != LLVMRet) {
+                    LLVMBuildRetVoid(ctx->llvm_builder);
+                }
+            }
+        }
+    }
+    
+    /* Cleanup */
+    if (param_types) xfree(param_types);
+    if (param_names) xfree(param_names);
 }
 
 void llvm_codegen_decl(BackendContext *ctx_opaque, ASTNode *decl) {
@@ -399,20 +720,56 @@ void llvm_codegen_decl(BackendContext *ctx_opaque, ASTNode *decl) {
     
     LLVMBackendContext *ctx = (LLVMBackendContext *)ctx_opaque;
     
+    /* Ensure we have a module for code generation */
+    if (!ctx->llvm_module) {
+        set_error(ctx, "No module available for code generation");
+        return;
+    }
+    
+    /* Debug output */
+    fprintf(stderr, "CODEGEN: Processing declaration type %d\n", decl->type);
+    
     switch (decl->type) {
         case AST_TRANSLATION_UNIT:
             /* Generate code for each declaration */
             for (size_t i = 0; i < decl->child_count; i++) {
-                llvm_codegen_decl(ctx_opaque, decl->children[i]);
+                if (decl->children[i]) {
+                    llvm_codegen_decl(ctx_opaque, decl->children[i]);
+                }
             }
             break;
             
         case AST_FUNCTION_DECL:
-            /* TODO: Implement function declaration codegen */
+            codegen_function_decl(ctx, decl);
+            break;
+            
+        case AST_VAR_DECL:
+            /* TODO: Handle variable declarations */
+            break;
+            
+        case AST_DECL_STMT:
+            /* Declaration statement - process children */
+            for (size_t i = 0; i < decl->child_count; i++) {
+                if (decl->children[i]) {
+                    llvm_codegen_decl(ctx_opaque, decl->children[i]);
+                }
+            }
+            break;
+            
+        case AST_NULL_STMT:
+            /* Empty statement - do nothing */
+            break;
+            
+        case AST_TYPE:
+        case AST_STRUCT_DECL:
+        case AST_UNION_DECL:
+        case AST_ENUM_DECL:
+            /* Type declarations - TODO: handle properly */
             break;
             
         default:
-            set_error(ctx, "Unsupported declaration type: %d", decl->type);
+            /* Don't error on unknown types, just skip them for now */
+            /* This prevents crashes on complex AST structures */
             break;
     }
 }
@@ -427,37 +784,49 @@ void llvm_optimize(BackendContext *ctx_opaque, void *module, int opt_level) {
     
     if (opt_level == 0) return;  /* No optimization */
     
-    /* Add optimization passes based on level */
-    LLVMPassManagerRef pm = ctx->module_pass_manager;
+    /* Use new PassBuilder API (LLVM 14+) */
+    LLVMPassBuilderOptionsRef options = LLVMCreatePassBuilderOptions();
     
-    /* Always add verification pass */
-    LLVMAddVerifierPass(pm);
-    
-    if (opt_level >= 1) {
-        /* Basic optimizations */
-        LLVMAddInstructionCombiningPass(pm);
-        LLVMAddReassociatePass(pm);
-        LLVMAddGVNPass(pm);
-        LLVMAddCFGSimplificationPass(pm);
-    }
+    /* Configure optimization options */
+    LLVMPassBuilderOptionsSetVerifyEach(options, 1);
     
     if (opt_level >= 2) {
-        /* More aggressive optimizations */
-        LLVMAddFunctionInliningPass(pm);
-        LLVMAddGlobalOptimizerPass(pm);
-        LLVMAddIPSCCPPass(pm);
-        LLVMAddDeadArgEliminationPass(pm);
-        LLVMAddAggressiveDCEPass(pm);
+        LLVMPassBuilderOptionsSetLoopInterleaving(options, 1);
+        LLVMPassBuilderOptionsSetLoopVectorization(options, 1);
+        LLVMPassBuilderOptionsSetSLPVectorization(options, 1);
     }
     
     if (opt_level >= 3) {
-        /* Maximum optimizations */
-        LLVMAddLoopVectorizePass(pm);
-        LLVMAddSLPVectorizePass(pm);
+        LLVMPassBuilderOptionsSetLoopUnrolling(options, 1);
     }
     
-    /* Run the passes */
-    LLVMRunPassManager(pm, mod);
+    /* Build pass pipeline string based on optimization level */
+    const char *passes = NULL;
+    switch (opt_level) {
+        case 1:
+            passes = "default<O1>";
+            break;
+        case 2:
+            passes = "default<O2>";
+            break;
+        case 3:
+            passes = "default<O3>";
+            break;
+        default:
+            passes = "default<O0>";
+            break;
+    }
+    
+    /* Run the optimization passes */
+    LLVMErrorRef error = LLVMRunPasses(mod, passes, ctx->target_machine, options);
+    
+    if (error) {
+        char *error_msg = LLVMGetErrorMessage(error);
+        set_error(ctx, "Optimization failed: %s", error_msg);
+        LLVMDisposeErrorMessage(error_msg);
+    }
+    
+    LLVMDisposePassBuilderOptions(options);
 }
 
 /* ===== OUTPUT ===== */

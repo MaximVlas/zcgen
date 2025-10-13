@@ -111,11 +111,47 @@ static bool skip_multi_line_comment(Lexer *lexer) {
     return false;
 }
 
+/* Skip preprocessor line markers like "# 123 "file.c"" */
+static bool skip_preprocessor_line_marker(Lexer *lexer) {
+    if (CURRENT(lexer) != '#') return false;
+    
+    /* Check if we're at the start of a line (or after whitespace) */
+    size_t pos = lexer->position;
+    if (pos > 0) {
+        /* Look back to see if there's only whitespace before # */
+        size_t check_pos = pos - 1;
+        while (check_pos > 0 && lexer->source[check_pos] != '\n') {
+            if (!isspace(lexer->source[check_pos])) {
+                return false; /* Not a line marker */
+            }
+            check_pos--;
+        }
+    }
+    
+    /* Look ahead to see if it's # followed by digit (line marker) */
+    if (pos + 1 < lexer->length && isdigit(lexer->source[pos + 1])) {
+        /* Skip entire line */
+        while (!AT_END(lexer) && CURRENT(lexer) != '\n') {
+            ADVANCE(lexer);
+        }
+        if (CURRENT(lexer) == '\n') {
+            lexer->line++;
+            lexer->column = 0;
+            ADVANCE(lexer);
+        }
+        return true;
+    }
+    
+    return false;
+}
+
 /* Skip comments and whitespace */
 static void skip_trivia(Lexer *lexer) {
     while (!AT_END(lexer)) {
         if (lexer->syntax->is_whitespace(CURRENT(lexer))) {
             skip_whitespace(lexer);
+        } else if (skip_preprocessor_line_marker(lexer)) {
+            continue;
         } else if (skip_single_line_comment(lexer)) {
             continue;
         } else if (skip_multi_line_comment(lexer)) {
@@ -324,24 +360,7 @@ static Token *lex_char(Lexer *lexer) {
 static Token *lex_operator_or_punct(Lexer *lexer) {
     SourceLocation loc = lexer_location(lexer);
     
-    /* Try operators first (longest match) */
-    for (size_t i = 0; i < lexer->syntax->operator_count; i++) {
-        const char *symbol = lexer->syntax->operators[i].symbol;
-        size_t len = strlen(symbol);
-        
-        if (lexer->position + len <= lexer->length &&
-            strncmp(&lexer->source[lexer->position], symbol, len) == 0) {
-            char *lexeme = xstrndup(symbol, len);
-            Token *token = token_create(lexer->syntax->operators[i].token_type,
-                                       lexeme, len, loc);
-            lexer->position += len;
-            lexer->column += len;
-            xfree(lexeme);
-            return token;
-        }
-    }
-    
-    /* Try punctuation */
+    /* Try punctuation first (longest match) */
     for (size_t i = 0; i < lexer->syntax->punctuation_count; i++) {
         const char *symbol = lexer->syntax->punctuation[i].symbol;
         size_t len = strlen(symbol);
@@ -350,6 +369,23 @@ static Token *lex_operator_or_punct(Lexer *lexer) {
             strncmp(&lexer->source[lexer->position], symbol, len) == 0) {
             char *lexeme = xstrndup(symbol, len);
             Token *token = token_create(lexer->syntax->punctuation[i].token_type,
+                                       lexeme, len, loc);
+            lexer->position += len;
+            lexer->column += len;
+            xfree(lexeme);
+            return token;
+        }
+    }
+    
+    /* Try operators */
+    for (size_t i = 0; i < lexer->syntax->operator_count; i++) {
+        const char *symbol = lexer->syntax->operators[i].symbol;
+        size_t len = strlen(symbol);
+        
+        if (lexer->position + len <= lexer->length &&
+            strncmp(&lexer->source[lexer->position], symbol, len) == 0) {
+            char *lexeme = xstrndup(symbol, len);
+            Token *token = token_create(lexer->syntax->operators[i].token_type,
                                        lexeme, len, loc);
             lexer->position += len;
             lexer->column += len;

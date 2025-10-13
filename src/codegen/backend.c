@@ -9,47 +9,61 @@ static size_t backend_count = 0;
 /* ===== REGISTRY ===== */
 
 void backend_register(Backend *backend) {
-    /* TODO: Register backend in global registry */
-    (void)backend;
+    if (!backend || backend_count >= 16) return;
+    registered_backends[backend_count++] = backend;
 }
 
 Backend *backend_get(BackendType type) {
-    /* TODO: Get backend by type */
-    (void)type;
+    /* For now, directly create LLVM backend if requested */
+    if (type == BACKEND_LLVM) {
+        return backend_llvm_create();
+    }
+    
+    /* Check registered backends */
+    for (size_t i = 0; i < backend_count; i++) {
+        if (registered_backends[i]->type == type) {
+            return registered_backends[i];
+        }
+    }
+    
     return NULL;
 }
 
 Backend *backend_get_by_name(const char *name) {
-    /* TODO: Get backend by name */
-    (void)name;
+    if (!name) return NULL;
+    
+    /* Check registered backends */
+    for (size_t i = 0; i < backend_count; i++) {
+        if (strcmp(registered_backends[i]->name, name) == 0) {
+            return registered_backends[i];
+        }
+    }
+    
     return NULL;
 }
 
 void backend_list_all(Backend ***backends, size_t *count) {
-    /* TODO: List all registered backends */
-    (void)backends;
-    (void)count;
+    if (backends) *backends = registered_backends;
+    if (count) *count = backend_count;
 }
 
 /* ===== SELECTION ===== */
 
 Backend *backend_select_default(void) {
-    /* TODO: Select default backend (LLVM if available) */
-    return NULL;
+    /* Default to LLVM backend */
+    return backend_llvm_create();
 }
 
 Backend *backend_select_for_target(const char *target_triple) {
-    /* TODO: Select best backend for target */
+    /* For now, always use LLVM */
     (void)target_triple;
-    return NULL;
+    return backend_llvm_create();
 }
 
 /* ===== BUILT-IN BACKENDS ===== */
 
-Backend *backend_llvm_create(void) {
-    /* TODO: Create LLVM backend */
-    return NULL;
-}
+/* LLVM backend is implemented in llvm_backend_impl.c */
+extern Backend *backend_llvm_create(void);
 
 Backend *backend_rust_create(void) {
     /* TODO: Create Rust backend (if available) */

@@ -12,12 +12,16 @@ ASTNode *ast_create_node(ASTNodeType type, SourceLocation loc) {
     node->children = NULL;
     node->child_count = 0;
     node->child_capacity = 0;
+    node->destroyed = false;
     return node;
 }
 
 /* Destroy AST node recursively */
 void ast_destroy_node(ASTNode *node) {
-    if (!node) return;
+    if (!node || node->destroyed) return;
+    
+    /* Mark as destroyed to prevent double-free */
+    node->destroyed = true;
     
     /* Destroy children */
     for (size_t i = 0; i < node->child_count; i++) {

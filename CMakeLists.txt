@@ -137,3 +137,19 @@ add_executable(test_lua
     src/preprocessor/preprocessor.c
 )
 target_link_libraries(test_lua ${LLVM_LIBS} ${LLVM_LDFLAGS} -lclang)
+
+add_executable(test_codegen
+    tests/test_codegen.c
+    src/common/error.c
+    src/common/memory.c
+    src/common/debug.c
+    src/syntax/c_syntax.c
+    src/lexer/lexer.c
+    src/parser/parser.c
+    src/parser/c_parser.c
+    src/ast/ast.c
+    src/codegen/codegen.c
+    src/codegen/backend.c
+    src/codegen/llvm_backend_impl.c
+)
+target_link_libraries(test_codegen ${LLVM_LIBS} ${LLVM_LDFLAGS})

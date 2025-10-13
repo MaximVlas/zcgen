@@ -305,6 +305,9 @@ struct ASTNode {
     size_t child_count;
     size_t child_capacity;
     
+    /* Destruction flag to prevent double-free */
+    bool destroyed;
+    
     /* Node-specific data */
     union {
         struct {

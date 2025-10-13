@@ -1,0 +1,1 @@
+static __uint16_t func(__uint16_t x);
