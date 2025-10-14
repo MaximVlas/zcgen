@@ -300,10 +300,50 @@ static Token *lex_string(Lexer *lexer) {
     
     ADVANCE(lexer); /* Skip closing quote */
     
-    size_t length = lexer->position - start;
-    char *lexeme = xstrndup(&lexer->source[start], length);
+    /* Extract string content without quotes */
+    size_t content_start = start + 1;  /* Skip opening quote */
+    size_t content_length = (lexer->position - 1) - content_start;  /* Exclude closing quote */
     
-    Token *token = token_create(TOKEN_STRING_LITERAL, lexeme, length, loc);
+    /* Process escape sequences */
+    char *raw_content = xstrndup(&lexer->source[content_start], content_length);
+    char *processed_content = xmalloc(content_length + 1);
+    size_t j = 0;
+    
+    for (size_t i = 0; i < content_length; i++) {
+        if (raw_content[i] == '\\' && i + 1 < content_length) {
+            i++; /* Skip backslash */
+            switch (raw_content[i]) {
+                case 'n': processed_content[j++] = '\n'; break;
+                case 't': processed_content[j++] = '\t'; break;
+                case 'r': processed_content[j++] = '\r'; break;
+                case '\\': processed_content[j++] = '\\'; break;
+                case '"': processed_content[j++] = '"'; break;
+                case '0': processed_content[j++] = '\0'; break;
+                default: 
+                    /* Unknown escape - keep as is */
+                    processed_content[j++] = '\\';
+                    processed_content[j++] = raw_content[i];
+                    break;
+            }
+        } else {
+            processed_content[j++] = raw_content[i];
+        }
+    }
+    processed_content[j] = '\0';
+    xfree(raw_content);
+    
+    /* Create lexeme with quotes for display */
+    size_t lexeme_length = lexer->position - start;
+    char *lexeme = xstrndup(&lexer->source[start], lexeme_length);
+    
+    Token *token = token_create(TOKEN_STRING_LITERAL, lexeme, lexeme_length, loc);
+    
+    /* Store the processed string content in the token */
+    if (token->value.string_value) {
+        xfree(token->value.string_value);
+    }
+    token->value.string_value = processed_content;
+    
     xfree(lexeme);
     return token;
 }

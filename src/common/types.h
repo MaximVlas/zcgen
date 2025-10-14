@@ -322,6 +322,7 @@ struct ASTNode {
             ASTNode **params;
             size_t param_count;
             ASTNode *body;
+            bool is_variadic;
         } func_decl;
         
         struct {

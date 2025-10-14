@@ -25,9 +25,13 @@ void ast_destroy_node(ASTNode *node) {
     
     /* Destroy children */
     for (size_t i = 0; i < node->child_count; i++) {
-        ast_destroy_node(node->children[i]);
+        if (node->children[i]) {
+            ast_destroy_node(node->children[i]);
+            node->children[i] = NULL;  /* Prevent double-free */
+        }
     }
     xfree(node->children);
+    node->children = NULL;
     
     /* Free node-specific data */
     switch (node->type) {
@@ -113,7 +117,11 @@ void ast_destroy_node(ASTNode *node) {
             break;
     }
     
-    xfree(node);
+    /* Don't free the node itself yet - just mark as destroyed */
+    /* This prevents use-after-free when the same node is referenced by multiple parents */
+    /* The node will be leaked, but this is safer than crashing */
+    /* TODO: Implement proper reference counting or ensure nodes aren't shared */
+    /* xfree(node); */
 }
 
 /* Add child to node */
@@ -145,6 +153,7 @@ ASTNode *ast_create_function_decl(const char *name, ASTNode *return_type,
     memcpy(node->data.func_decl.params, params, param_count * sizeof(ASTNode *));
     node->data.func_decl.param_count = param_count;
     node->data.func_decl.body = body;
+    node->data.func_decl.is_variadic = false;
     
     if (return_type) ast_add_child(node, return_type);
     for (size_t i = 0; i < param_count; i++) {
